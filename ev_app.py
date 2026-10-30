@@ -46,6 +46,10 @@ class EvApp:
     def quitter(self):
         pass
 
+    def traiter_cycle(self):
+        """Traitement periodique, meme lorsque des messages arrivent en continu."""
+        pass
+
     @staticmethod
     def decoder_message(message):
         if len(message) != TAILLE_MSG_TOT:
@@ -56,6 +60,9 @@ class EvApp:
     def run(self):
         try:
             while not self._termine:
+                self.traiter_cycle()
+                if self._termine:
+                    break
                 readable, _, _ = select.select([self.udp_sock], [], [], self.tmo)
                 if not readable:
                     self.dispatch_event(None)

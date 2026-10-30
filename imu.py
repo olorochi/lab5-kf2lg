@@ -1,53 +1,92 @@
-import time
-from threading import Thread, Event, Lock
-from icm20948 import ICM20948
-from param import ICM20948_DT
+"""Navigation inertielle, avec les axes ay, gx et (my, mz) de l'enonce."""
+
+import math
+from collections import deque
+
+from param import FENETRE_BIAIS, GRAVITE, SENS_CAP_MAGNETIQUE
+
 
 class IMU:
-    def __init__(self, imu: ICM20948):
+    def __init__(self, imu):
         self.imu = imu
-        self.quit = Event()
-        self.lock = Lock()
-        self.thread = Thread(target=self.poll_thr, daemon=True, args=(imu, self.quit))
-        self.thread.start()
+        self.accel_data = None
+        self.magne_data = None
+        self._ay_repos = deque(maxlen=FENETRE_BIAIS)
+        self._gx_repos = deque(maxlen=FENETRE_BIAIS)
+        self.ay_biais = 0.0
+        self.gx_biais = 0.0
+        self.corr_my = 0.0
+        self.corr_mz = 0.0
+        self.calibration_magnetometre = False
+        self.min_my = self.min_mz = math.inf
+        self.max_my = self.max_mz = -math.inf
+        self.reinitialiser_deplacement()
 
-        accel_data = None
-        magne_data = None
+    @property
+    def biais_pret(self):
+        return len(self._ay_repos) == FENETRE_BIAIS
 
-    def __del__(self):
-        self.quit.set()
-        self.thread.join()
+    @property
+    def vitesse_angulaire(self):
+        if self.accel_data is None:
+            return 0.0
+        return self.accel_data[3] - self.gx_biais
 
-    def obtenir_déplacement():
-        with self.lock:
-            ax, ay, az, gx, gy, gz = self.accel_data
+    def reinitialiser_deplacement(self):
+        self.vy = 0.0
+        self.dist_y = 0.0
+        self.angle_rot = 0.0
+        self._ay_precedent = 0.0
+        self._gx_precedent = 0.0
 
-    def obtenir_cap_magnétique():
-        with self.lock:
-            mx, my, mz = self.magne_data
+    def obtenir_deplacement(self, est_actif, dt, *, calibrer_biais=True):
+        if not math.isfinite(dt) or dt <= 0:
+            raise ValueError("dt doit etre positif et fini")
+        self.accel_data = tuple(self.imu.read_accelerometer_gyro_data())
+        if len(self.accel_data) != 6 or not all(map(math.isfinite, self.accel_data)):
+            raise ValueError("Lecture accelerometre/gyroscope invalide")
+        _, ay, _, gx, _, _ = self.accel_data
 
-    def poll_thr(self):
-        start = time.monotonic()
-        last = 0
-        try:
-            while not self.quit.is_set():
-                with self.lock:
-                    activation = time.monotonic() - start
-                    self.accel_data = self.imu.read_accelerometer_gyro_data()
-                    self.magne_data = self.imu.read_magnetometer_data()
-                    t = time.monotonic() - start
-                    dt = t - last
-                    last = t
-                    
-                    time.sleep(ICM20948_DT - (t - activation))
+        if not est_actif:
+            if calibrer_biais:
+                self._ay_repos.append(ay)
+                self._gx_repos.append(gx)
+                self.ay_biais = sum(self._ay_repos) / len(self._ay_repos)
+                self.gx_biais = sum(self._gx_repos) / len(self._gx_repos)
+            self.reinitialiser_deplacement()
+        else:
+            ay -= self.ay_biais
+            gx -= self.gx_biais
+            vy_precedent = self.vy
+            self.vy += dt * (ay + self._ay_precedent) / 2 * GRAVITE
+            self.dist_y += dt * (self.vy + vy_precedent) / 2
+            self.angle_rot += dt * (gx + self._gx_precedent) / 2
+            self._ay_precedent = ay
+            self._gx_precedent = gx
 
-        except (Exception) as error:
-            print(error)
+        return self.angle_rot, self.dist_y
 
-        print("poll_thr exit")
+    def commencer_calibration_magnetometre(self):
+        self.min_my = self.min_mz = math.inf
+        self.max_my = self.max_mz = -math.inf
+        self.calibration_magnetometre = True
 
+    def terminer_calibration_magnetometre(self):
+        if self.max_my <= self.min_my or self.max_mz <= self.min_mz:
+            raise ValueError("Calibration magnetique incomplete : verifier les axes my/mz")
+        self.calibration_magnetometre = False
 
-if __name__ == "__main__":
-    imu = IMU(ICM20948())
-    time.sleep(5)
-    del(imu)
+    def obtenir_cap_magnetique(self):
+        self.magne_data = tuple(self.imu.read_magnetometer_data())
+        if len(self.magne_data) != 3 or not all(map(math.isfinite, self.magne_data)):
+            raise ValueError("Lecture magnetometre invalide")
+        _, my, mz = self.magne_data
+        if self.calibration_magnetometre:
+            self.min_my = min(self.min_my, my)
+            self.max_my = max(self.max_my, my)
+            self.min_mz = min(self.min_mz, mz)
+            self.max_mz = max(self.max_mz, mz)
+            self.corr_my = (self.max_my + self.min_my) / 2
+            self.corr_mz = (self.max_mz + self.min_mz) / 2
+        angle = math.atan2(mz - self.corr_mz, my - self.corr_my)
+        return int(math.degrees(angle) * SENS_CAP_MAGNETIQUE % 360)
