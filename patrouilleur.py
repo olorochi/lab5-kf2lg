@@ -3,25 +3,32 @@
 
 import math
 import time
+from collections import deque
 
 from ev_app import EvApp
 from ev_app_client_api import gen_ev_externe
 from param import (
-    ANGLE_DEMI_TOUR, APP_CTRL_ROBOT, APP_PATROUILLEUR,
+    ANGLE_APPROCHE_DEMI_TOUR, ANGLE_DEMI_TOUR, APP_CTRL_ROBOT, APP_PATROUILLEUR,
     DELAI_ATTENTE_IMU, DELAI_AVANCE_MAX, DELAI_COMMUNICATION,
     DELAI_ROTATION_MAX, DISTANCE_PATROUILLE, DUREE_ARRET,
+    FENETRE_BIAIS, GAIN_CORRECTION_CAP,
+    IMPULSION_CORRECTION_MAX, IMPULSION_CORRECTION_MIN,
     INTERVALLE_AFFICHAGE_IMU, INTERVALLE_COMMANDE, INTERVALLE_CONTROLE, IP_CTRL_ROBOT,
-    MSG_ARRETER, MSG_AVANCER, MSG_IMU_INFO, MSG_PIVOTER_G,
+    MSG_ARRETER, MSG_AVANCER, MSG_IMU_INFO, MSG_PIVOTER_D, MSG_PIVOTER_G,
+    NB_CORRECTIONS_CAP_MAX, TEMPS_STABILISATION, TOLERANCE_CAP,
+    TOLERANCE_REMISE_A_ZERO_ANGLE, TOLERANCE_REMISE_A_ZERO_DISTANCE,
+    VERIFIER_CAP_DEMI_TOUR, VITESSE_ANGULAIRE_INITIALE,
 )
 
 
 class Patrouilleur(EvApp):
     def __init__(self, port_no=APP_PATROUILLEUR, horloge=time.monotonic,
-                 envoyer=gen_ev_externe, **app_options):
+                 envoyer=gen_ev_externe, verifier_cap=VERIFIER_CAP_DEMI_TOUR, **app_options):
         app_options.setdefault("tmo", INTERVALLE_CONTROLE)
         super().__init__(port_no, **app_options)
         self.horloge = horloge
         self.envoyer = envoyer
+        self.verifier_cap = verifier_cap
         self.etat = "ATTENTE_IMU"
         self.commande = MSG_ARRETER
         self._debut_etat = horloge()
@@ -31,7 +38,16 @@ class Patrouilleur(EvApp):
         self._arret_confirme = None
         self._apres_arret = MSG_AVANCER
         self.nombre_trajets = 0
+        self._caps_repos = deque(maxlen=FENETRE_BIAIS)
+        self._cap_cible = None
+        self._nombre_corrections = 0
+        self._vitesse_angulaire = VITESSE_ANGULAIRE_INITIALE
+        self._angle_precedent = 0.0
+        self._temps_angle = horloge()
+        self._fin_impulsion = None
         print("En attente de la fin de calibration du controleur...")
+        if not self.verifier_cap:
+            print("Demi-tour valide par le gyroscope a 180 degres; cap magnetique indicatif.")
 
     def _envoyer_commande(self):
         self.envoyer(IP_CTRL_ROBOT, APP_CTRL_ROBOT, self.commande)
@@ -43,7 +59,55 @@ class Patrouilleur(EvApp):
         self._debut_etat = self.horloge()
         self._arret_confirme = None
         self._apres_arret = prochaine_commande
+        self._caps_repos.clear()
+        self._fin_impulsion = None
+        self.tmo = INTERVALLE_CONTROLE
         self._envoyer_commande()
+
+    @staticmethod
+    def erreur_cap(cible, mesure):
+        return (cible - mesure + 180) % 360 - 180
+
+    def _cap_moyen_repos(self):
+        sinus = sum(math.sin(math.radians(c)) for c in self._caps_repos)
+        cosinus = sum(math.cos(math.radians(c)) for c in self._caps_repos)
+        return math.degrees(math.atan2(sinus, cosinus)) % 360
+
+    def _lancer_mouvement(self, commande, cap, maintenant):
+        self.commande = commande
+        self.etat = "AVANCE" if commande == MSG_AVANCER else "PIVOT"
+        self._debut_etat = maintenant
+        self._prochain_affichage = maintenant
+        if self.etat == "PIVOT":
+            self._cap_cible = (cap + ANGLE_DEMI_TOUR) % 360
+            self._nombre_corrections = 0
+            self._vitesse_angulaire = VITESSE_ANGULAIRE_INITIALE
+            self._angle_precedent = 0.0
+            self._temps_angle = maintenant
+        self._envoyer_commande()
+        print(f"{self.etat} : cap de depart {cap:.1f} degres."
+              + (f" Cible magnetique {self._cap_cible:.1f}."
+                 if self.etat == "PIVOT" and self.verifier_cap else ""))
+
+    def _verifier_demi_tour(self, cap, maintenant):
+        erreur = self.erreur_cap(self._cap_cible, cap)
+        print(f"Verification moteurs arretes : cap={cap:.1f}, "
+              f"cible={self._cap_cible:.1f}, ecart={erreur:+.1f} degres.")
+        if abs(erreur) <= TOLERANCE_CAP:
+            self._cap_cible = None
+            self._lancer_mouvement(MSG_AVANCER, cap, maintenant)
+        elif self._nombre_corrections >= NB_CORRECTIONS_CAP_MAX:
+            self._abandonner("Cap cible non atteint : verifier le compas et le montage.")
+        else:
+            duree = GAIN_CORRECTION_CAP * abs(erreur) / self._vitesse_angulaire
+            duree = max(IMPULSION_CORRECTION_MIN, min(IMPULSION_CORRECTION_MAX, duree))
+            self.commande = MSG_PIVOTER_D if erreur > 0 else MSG_PIVOTER_G
+            self.etat = "CORRECTION"
+            self._debut_etat = maintenant
+            self._fin_impulsion = maintenant + duree
+            self._nombre_corrections += 1
+            self.tmo = min(INTERVALLE_CONTROLE, duree)
+            self._envoyer_commande()
 
     def _abandonner(self, raison):
         print(raison)
@@ -79,29 +143,53 @@ class Patrouilleur(EvApp):
         if self.etat == "ATTENTE_IMU":
             self._demander_arret(MSG_AVANCER)
         elif self.etat == "ARRET":
-            if abs(angle_rot) > 1e-9 or abs(dist_y) > 1e-9:
+            if (abs(angle_rot) > TOLERANCE_REMISE_A_ZERO_ANGLE
+                    or abs(dist_y) > TOLERANCE_REMISE_A_ZERO_DISTANCE):
                 self._arret_confirme = None
+                self._caps_repos.clear()
             elif self._arret_confirme is None:
                 self._arret_confirme = maintenant
-            elif maintenant - self._arret_confirme >= DUREE_ARRET:
-                self.commande = self._apres_arret
-                self.etat = "AVANCE" if self.commande == MSG_AVANCER else "PIVOT"
-                self._debut_etat = maintenant
-                self._prochain_affichage = maintenant
-                self._envoyer_commande()
-                print(f"{self.etat} : cap magnetique {cap_mag:.0f} degres.")
+            else:
+                if maintenant - self._arret_confirme >= TEMPS_STABILISATION:
+                    self._caps_repos.append(cap_mag)
+                if maintenant - self._arret_confirme >= DUREE_ARRET:
+                    cap_repos = self._cap_moyen_repos()
+                    if self._apres_arret is None:
+                        self._verifier_demi_tour(cap_repos, maintenant)
+                    else:
+                        self._lancer_mouvement(self._apres_arret, cap_repos, maintenant)
         elif self.etat == "AVANCE" and distance >= DISTANCE_PATROUILLE:
             self.nombre_trajets += 1
             print(f"Trajet {self.nombre_trajets} : {distance:.3f} m "
                   f"(dist_y={dist_y:+.3f}). Arret avant demi-tour.")
             self._demander_arret(MSG_PIVOTER_G)
-        elif self.etat == "PIVOT" and abs(angle_rot) >= ANGLE_DEMI_TOUR:
-            print(f"Demi-tour : {angle_rot:.1f} degres, cap {cap_mag:.0f}. Arret avant avance.")
-            self._demander_arret(MSG_AVANCER)
+        elif self.etat == "PIVOT":
+            dt = maintenant - self._temps_angle
+            if dt > 0 and angle_rot != self._angle_precedent:
+                self._vitesse_angulaire = max(10.0, abs(angle_rot - self._angle_precedent) / dt)
+            self._angle_precedent = angle_rot
+            self._temps_angle = maintenant
+            seuil = ANGLE_APPROCHE_DEMI_TOUR if self.verifier_cap else ANGLE_DEMI_TOUR
+            if abs(angle_rot) >= seuil:
+                if self.verifier_cap:
+                    print(f"Approche du demi-tour : {angle_rot:.1f} degres. "
+                          "Arret pour verifier le cap et corriger par impulsions.")
+                    self._demander_arret(None)
+                else:
+                    print(f"Demi-tour valide par le gyroscope : {angle_rot:.1f} degres. "
+                          "Arret avant la reprise de l'avance.")
+                    self._cap_cible = None
+                    self._demander_arret(MSG_AVANCER)
 
     def traiter_cycle(self):
         maintenant = self.horloge()
         if self.etat == "TERMINE":
+            return
+        if self.etat == "CORRECTION":
+            if maintenant >= self._fin_impulsion:
+                self._demander_arret(None)
+            else:
+                self.tmo = min(INTERVALLE_CONTROLE, self._fin_impulsion - maintenant)
             return
         if self.etat == "ATTENTE_IMU":
             if maintenant - self._debut_etat > DELAI_ATTENTE_IMU:
