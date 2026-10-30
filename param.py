@@ -55,8 +55,6 @@ NB_TOURS_CALIBRATION = 3
 IMPULSION_CALIBRATION = 0.40
 REPOS_CALIBRATION = 0.45
 ANGLE_APPROCHE_DEMI_TOUR = 165.0
-# Le laboratoire accepte l'angle du gyroscope OU le cap pour le demi-tour.
-# Le compas n'est donc pas une condition obligatoire de reprise par defaut.
 VERIFIER_CAP_DEMI_TOUR = False
 TOLERANCE_CAP = 5.0
 TOLERANCE_REMISE_A_ZERO_ANGLE = 1.0  # degres
