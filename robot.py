@@ -33,6 +33,16 @@ class Robot:
         self._moteur_gauche.avancer(puissance)
         self._moteur_droit.avancer(puissance)
 
+    def avancer_corrige(self, correction):
+        """Petite correction de cap sans interrompre l'avance."""
+        puissance = self.limiter_vitesse(self.vitesse)
+        if puissance == 0:
+            self.arreter()
+            return
+        correction = max(-min(0.05, puissance/2), min(min(0.05, puissance/2), correction))
+        self._moteur_gauche.avancer(self.limiter_vitesse(puissance-correction))
+        self._moteur_droit.avancer(self.limiter_vitesse(puissance+correction))
+
     def reculer(self):
         puissance = self.limiter_vitesse(self.vitesse)
         if puissance == 0:
