@@ -96,7 +96,7 @@ class CtrlRobot(EvApp):
                 if not math.isfinite(angle) or not 0 < angle <= 1080 or identifiant < 1:
                     raise ValueError("Cible de rotation invalide")
                 if self.rotation_id == identifiant:
-                    return  # Les repetitions UDP ne redemarrent jamais la rotation.
+                    return
                 if self.rotation and self.rotation.en_mouvement:
                     raise ValueError("Une rotation est deja en cours")
                 self.robot.vitesse = self.vitesse_cible

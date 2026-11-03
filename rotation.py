@@ -1,4 +1,4 @@
-"""Rotation commande en angle cumule."""
+"""Rotation commander en angle."""
 
 import math
 from collections import deque

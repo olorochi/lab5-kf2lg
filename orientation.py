@@ -34,7 +34,6 @@ class CapDeroule:
 
     @classmethod
     def depuis_reference(cls, reference, cap, angle_approximatif):
-        """Le gyro choisit le nombre de tours; le compas fixe la fraction."""
         fraction = ecart_cap(cap, reference)
         tours = round((angle_approximatif - fraction) / 360.0)
         return cls(cap, fraction + tours * 360.0)
